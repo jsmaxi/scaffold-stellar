@@ -1,20 +1,36 @@
-use clap::Parser;
-use degit::degit;
+use clap::{Args, Parser};
+use degit_rs::degit;
 use std::fs::{copy, metadata, read_dir, remove_dir_all};
 use std::path::PathBuf;
 use std::process::Command;
 use std::{env, io};
 
-use super::generate;
+use super::{build, generate};
 use stellar_cli::{commands::global, print::Print};
 
-const FRONTEND_TEMPLATE: &str = "https://github.com/theahaco/scaffold-stellar-frontend";
+pub const FRONTEND_TEMPLATE: &str = "theahaco/scaffold-stellar-frontend";
+const TUTORIAL_BRANCH: &str = "tutorial";
 
 /// A command to initialize a new project
 #[derive(Parser, Debug, Clone)]
 pub struct Cmd {
     /// The path to the project must be provided
     pub project_path: PathBuf,
+
+    #[command(flatten)]
+    vers: Vers,
+}
+
+#[derive(Args, Debug, Clone)]
+#[group(multiple = false)]
+struct Vers {
+    /// Initialize the tutorial project instead of the default project
+    #[arg(long, default_value_t = false)]
+    pub tutorial: bool,
+
+    /// Optional argument to specify a tagged version
+    #[arg(long)]
+    pub tag: Option<String>,
 }
 
 /// Errors that can occur during initialization
@@ -63,7 +79,13 @@ impl Cmd {
             .to_str()
             .ok_or(Error::InvalidProjectPathEncoding)?;
 
-        degit(FRONTEND_TEMPLATE, project_str);
+        let mut repo = FRONTEND_TEMPLATE.to_string();
+        if let Some(tag) = self.vers.tag.as_deref() {
+            repo = format!("{repo}#{tag}");
+        } else if self.vers.tutorial {
+            repo = format!("{repo}#{TUTORIAL_BRANCH}");
+        }
+        degit(repo.as_str(), project_str);
 
         if metadata(&absolute_project_path).is_err()
             || read_dir(&absolute_project_path)?.next().is_none()
@@ -86,14 +108,52 @@ impl Cmd {
         }
 
         // Update the project's OpenZeppelin examples with the latest editions
-        let example_contracts = ["nft-enumerable", "fungible-allowlist"];
+        if !self.vers.tutorial {
+            let example_contracts = ["nft-enumerable", "fungible-allowlist"];
 
-        for contract in example_contracts {
-            self.update_oz_example(&absolute_project_path, contract, global_args)
-                .await?;
+            for contract in example_contracts {
+                self.update_oz_example(&absolute_project_path, contract, global_args)
+                    .await?;
+            }
         }
 
+        // Install npm dependencies
+        printer.infoln("Installing npm dependencies...");
+        let npm_install_command = Command::new("npm")
+            .arg("install")
+            .current_dir(&absolute_project_path)
+            .output()?;
+        if !npm_install_command.status.success() {
+            printer.warnln(
+                "Failed to install dependencies, run 'npm install' in the project directory",
+            );
+        }
+
+        // Build contracts and create contract clients
+        printer.infoln("Building contracts and generating client code...");
+        // Use clap to parse build command with defaults, then configure programmatically
+        let mut build_command = build::Command::parse_from(["build", "--build-clients"]);
+        build_command.build.manifest_path = Some(absolute_project_path.join("Cargo.toml"));
+        build_command.build_clients_args.env = Some(build::clients::ScaffoldEnv::Development);
+        build_command.build_clients_args.workspace_root = Some(absolute_project_path.clone());
+        let mut build_args = global_args.clone();
+        if !(global_args.verbose && global_args.very_verbose) {
+            build_args.quiet = true;
+        }
+
+        if let Err(e) = build_command.run(&build_args).await {
+            printer.warnln(format!("Failed to build contract clients: {e}"));
+        }
+
+        printer.blankln("\n\n");
         printer.checkln(format!("Project successfully created at {project_str}"));
+        printer.blankln(" You can now run the application with:\n");
+        printer.blankln(format!("\tcd {}", self.project_path.display()));
+        if !npm_install_command.status.success() {
+            printer.blankln("\tnpm install");
+        }
+        printer.blankln("\tnpm start\n");
+        printer.blankln(" Happy hacking! 🚀");
         Ok(())
     }
 
