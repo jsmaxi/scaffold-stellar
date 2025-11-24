@@ -1,5 +1,5 @@
 use clap::{Args, Parser};
-use degit_rs::degit;
+use degit::degit;
 use std::fs::{copy, metadata, read_dir, remove_dir_all};
 use std::path::PathBuf;
 use std::process::Command;
@@ -77,7 +77,8 @@ impl Cmd {
 
         let project_str = absolute_project_path
             .to_str()
-            .ok_or(Error::InvalidProjectPathEncoding)?;
+            .ok_or(Error::InvalidProjectPathEncoding)?
+            .to_owned();
 
         let mut repo = FRONTEND_TEMPLATE.to_string();
         if let Some(tag) = self.vers.tag.as_deref() {
@@ -85,13 +86,18 @@ impl Cmd {
         } else if self.vers.tutorial {
             repo = format!("{repo}#{TUTORIAL_BRANCH}");
         }
-        degit(repo.as_str(), project_str);
+        tokio::task::spawn_blocking(move || {
+            degit(repo.as_str(), &project_str);
+        })
+        .await
+        .expect("Blocking task panicked");
 
         if metadata(&absolute_project_path).is_err()
             || read_dir(&absolute_project_path)?.next().is_none()
         {
             return Err(Error::DegitError(format!(
-                "Failed to clone template into {project_str}: directory is empty or missing",
+                "Failed to clone template into {}: directory is empty or missing",
+                absolute_project_path.display()
             )));
         }
 
@@ -99,13 +105,6 @@ impl Cmd {
         let example_path = absolute_project_path.join(".env.example");
         let env_path = absolute_project_path.join(".env");
         copy(example_path, env_path)?;
-
-        // If git is installed, run init and make initial commit
-        if git_exists() {
-            git_init(&absolute_project_path);
-            git_add(&absolute_project_path, &["-A"]);
-            git_commit(&absolute_project_path, "initial commit");
-        }
 
         // Update the project's OpenZeppelin examples with the latest editions
         if !self.vers.tutorial {
@@ -118,16 +117,7 @@ impl Cmd {
         }
 
         // Install npm dependencies
-        printer.infoln("Installing npm dependencies...");
-        let npm_install_command = Command::new("npm")
-            .arg("install")
-            .current_dir(&absolute_project_path)
-            .output()?;
-        if !npm_install_command.status.success() {
-            printer.warnln(
-                "Failed to install dependencies, run 'npm install' in the project directory",
-            );
-        }
+        let npm_status = npm_install(&absolute_project_path, &printer);
 
         // Build contracts and create contract clients
         printer.infoln("Building contracts and generating client code...");
@@ -145,11 +135,21 @@ impl Cmd {
             printer.warnln(format!("Failed to build contract clients: {e}"));
         }
 
+        // If git is installed, run init and make initial commit
+        if git_exists() {
+            git_init(&absolute_project_path);
+            git_add(&absolute_project_path, &["-A"]);
+            git_commit(&absolute_project_path, "initial commit");
+        }
+
         printer.blankln("\n\n");
-        printer.checkln(format!("Project successfully created at {project_str}"));
+        printer.checkln(format!(
+            "Project successfully created at {}!",
+            absolute_project_path.display()
+        ));
         printer.blankln(" You can now run the application with:\n");
         printer.blankln(format!("\tcd {}", self.project_path.display()));
-        if !npm_install_command.status.success() {
+        if !npm_status {
             printer.blankln("\tnpm install");
         }
         printer.blankln("\tnpm start\n");
@@ -220,9 +220,46 @@ impl Cmd {
     }
 }
 
+// Check if npm is installed and exists in PATH
+fn npm_exists() -> bool {
+    Command::new("npm").arg("--version").output().is_ok()
+}
+
+// Install npm dependencies
+fn npm_install(path: &PathBuf, printer: &Print) -> bool {
+    if !npm_exists() {
+        printer.warnln("Failed to install dependencies, npm is not installed");
+        return false;
+    }
+
+    printer.infoln("Installing npm dependencies...");
+    match Command::new("npm")
+        .arg("install")
+        .current_dir(path)
+        .output()
+    {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            // Command ran without panic, but failed for some other reason
+            // like network issue or missing dependency, etc.
+            printer.warnln("Failed to install dependencies: Please run 'npm install' manually");
+            if !output.stderr.is_empty()
+                && let Ok(stderr) = String::from_utf8(output.stderr)
+            {
+                printer.warnln(format!("Error: {}", stderr.trim()));
+            }
+            false
+        }
+        Err(e) => {
+            printer.warnln(format!("Failed to run npm install: {e}"));
+            false
+        }
+    }
+}
+
 // Check if git is installed and exists in PATH
 fn git_exists() -> bool {
-    Command::new("git").arg("--version").output().is_err()
+    Command::new("git").arg("--version").output().is_ok()
 }
 
 // Initialize a new git repository
